@@ -34,18 +34,21 @@ int main() {
 
     while (1) {
         memset(buffer, 0, BUFFER_SIZE);
-        int bytes_read = read(sock, buffer, BUFFER_SIZE);
+        int bytes_read = read(sock, buffer, BUFFER_SIZE - 1);
         if (bytes_read <= 0) {
             printf("Server disconnected.\n");
             break;
         }
-        printf("%s", buffer);
+        buffer[bytes_read] = '\0'; // Ensure null termination
+        printf("%s", buffer);     // Print the server's message
 
+        // Get user input
         memset(buffer, 0, BUFFER_SIZE);
         fgets(buffer, BUFFER_SIZE, stdin);
-        buffer[strcspn(buffer, "\n")] = 0; // Trim newline character
+        buffer[strcspn(buffer, "\n")] = '\0'; // Trim newline character
         send(sock, buffer, strlen(buffer), 0);
 
+        // Exit if the user enters 'exit'
         if (strcmp(buffer, "exit") == 0) {
             printf("Exiting...\n");
             break;
