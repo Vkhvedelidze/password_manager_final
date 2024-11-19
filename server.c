@@ -4,168 +4,190 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <openssl/sha.h>
 
 #define PORT 8080
-#define MAX_CLIENTS 10
 #define BUFFER_SIZE 1024
-
-typedef struct {
-    char website[50];
-    char password[50];
-} PasswordEntry;
-
-typedef struct {
-    char username[50];
-    char password[50];
-} User;
-
-// Predefined user credentials
-User userList[] = {
-    {"admin", "password123"},
-    {"user1", "mypassword1"}
-};
-int userCount = 2;
-
-PasswordEntry passwordStore[100];
-int passwordCount = 0;
 
 pthread_mutex_t lock;
 
-int authenticate_user(const char *username, const char *password) {
-    for (int i = 0; i < userCount; i++) {
-        if (strcmp(userList[i].username, username) == 0 &&
-            strcmp(userList[i].password, password) == 0) {
-            return 1; // Valid credentials
-        }
+typedef struct {
+    char username[50];
+    char password_hash[65]; // SHA-256 hash length
+} User;
+
+// Hash a string using SHA-256
+void hash_password(const char *password, char *hash_out) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256((unsigned char *)password, strlen(password), hash);
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        sprintf(hash_out + (i * 2), "%02x", hash[i]);
     }
-    return 0; // Invalid credentials
+    hash_out[64] = '\0';
 }
 
+// Authenticate user from file
+int authenticate_user(const char *username, const char *password) {
+    FILE *file = fopen("users.txt", "r");
+    if (!file) {
+        perror("Failed to open user file");
+        return 0;
+    }
+    char stored_user[50], stored_hash[65], password_hash[65];
+    hash_password(password, password_hash);
+    while (fscanf(file, "%s %s", stored_user, stored_hash) != EOF) {
+        if (strcmp(username, stored_user) == 0 && strcmp(password_hash, stored_hash) == 0) {
+            fclose(file);
+            return 1;
+        }
+    }
+    fclose(file);
+    return 0;
+}
+
+// Register a new user
+int register_user(const char *username, const char *password) {
+    FILE *file = fopen("users.txt", "a");
+    if (!file) {
+        perror("Failed to open user file for writing");
+        return 0;
+    }
+    char password_hash[65];
+    hash_password(password, password_hash);
+    fprintf(file, "%s %s\n", username, password_hash);
+    fclose(file);
+    return 1;
+}
+
+// Save password entry to file
+void save_password(const char *website, const char *password) {
+    FILE *file = fopen("passwords.txt", "a");
+    if (!file) {
+        perror("Failed to open passwords file");
+        return;
+    }
+    fprintf(file, "%s %s\n", website, password);
+    fclose(file);
+}
+
+// Retrieve password by website
+void retrieve_password(const char *website, char *response) {
+    FILE *file = fopen("passwords.txt", "r");
+    if (!file) {
+        perror("Failed to open passwords file");
+        strcpy(response, "Error opening file.\n");
+        return;
+    }
+    char stored_website[50], stored_password[50];
+    while (fscanf(file, "%s %s", stored_website, stored_password) != EOF) {
+        if (strcmp(website, stored_website) == 0) {
+            snprintf(response, BUFFER_SIZE, "Password: %s\n", stored_password);
+            fclose(file);
+            return;
+        }
+    }
+    strcpy(response, "Website not found.\n");
+    fclose(file);
+}
+
+// Handle client connection
 void *handle_client(void *socket_desc) {
     int new_socket = *(int *)socket_desc;
     free(socket_desc);
 
-    char buffer[BUFFER_SIZE];
-    char username[50], password[50];
+    char buffer[BUFFER_SIZE], username[50], password[50];
+    memset(username, 0, sizeof(username));
+    memset(password, 0, sizeof(password));
 
     // Authentication
-    send(new_socket, "Username: ", strlen("Username: "), 0);
+    send(new_socket, "1. Login\n2. Register\nEnter choice: ", strlen("1. Login\n2. Register\nEnter choice: "), 0);
     memset(buffer, 0, BUFFER_SIZE);
-    read(new_socket, buffer, BUFFER_SIZE);
-    buffer[strcspn(buffer, "\n")] = 0; // Trim newline
-    strncpy(username, buffer, sizeof(username));
+    read(new_socket, buffer, BUFFER_SIZE - 1);
+    buffer[strcspn(buffer, "\n")] = '\0';
 
-    send(new_socket, "Password: ", strlen("Password: "), 0);
-    memset(buffer, 0, BUFFER_SIZE);
-    read(new_socket, buffer, BUFFER_SIZE);
-    buffer[strcspn(buffer, "\n")] = 0; // Trim newline
-    strncpy(password, buffer, sizeof(password));
+    if (strcmp(buffer, "1") == 0) { // Login
+        send(new_socket, "Username: ", strlen("Username: "), 0);
+        memset(buffer, 0, BUFFER_SIZE);
+        int bytes_read = read(new_socket, buffer, sizeof(buffer) - 1);
+        if (bytes_read > sizeof(username) - 1) bytes_read = sizeof(username) - 1;
+        buffer[bytes_read] = '\0';
+        strncpy(username, buffer, sizeof(username) - 1);
 
-    if (!authenticate_user(username, password)) {
-        send(new_socket, "Invalid credentials. Disconnecting.\n", strlen("Invalid credentials. Disconnecting.\n"), 0);
-        close(new_socket);
-        pthread_exit(NULL);
+        send(new_socket, "Password: ", strlen("Password: "), 0);
+        memset(buffer, 0, BUFFER_SIZE);
+        bytes_read = read(new_socket, buffer, sizeof(buffer) - 1);
+        if (bytes_read > sizeof(password) - 1) bytes_read = sizeof(password) - 1;
+        buffer[bytes_read] = '\0';
+        strncpy(password, buffer, sizeof(password) - 1);
+
+        if (!authenticate_user(username, password)) {
+            send(new_socket, "Invalid credentials. Disconnecting.\n", strlen("Invalid credentials. Disconnecting.\n"), 0);
+            close(new_socket);
+            pthread_exit(NULL);
+        }
+        send(new_socket, "Login successful!\n", strlen("Login successful!\n"), 0);
+
+    } else if (strcmp(buffer, "2") == 0) { // Register
+        send(new_socket, "Username: ", strlen("Username: "), 0);
+        memset(buffer, 0, BUFFER_SIZE);
+        int bytes_read = read(new_socket, buffer, sizeof(buffer) - 1);
+        if (bytes_read > sizeof(username) - 1) bytes_read = sizeof(username) - 1;
+        buffer[bytes_read] = '\0';
+        strncpy(username, buffer, sizeof(username) - 1);
+
+        send(new_socket, "Password: ", strlen("Password: "), 0);
+        memset(buffer, 0, BUFFER_SIZE);
+        bytes_read = read(new_socket, buffer, sizeof(buffer) - 1);
+        if (bytes_read > sizeof(password) - 1) bytes_read = sizeof(password) - 1;
+        buffer[bytes_read] = '\0';
+        strncpy(password, buffer, sizeof(password) - 1);
+
+        if (register_user(username, password)) {
+            send(new_socket, "Registration successful!\n", strlen("Registration successful!\n"), 0);
+        } else {
+            send(new_socket, "Registration failed. Try again.\n", strlen("Registration failed. Try again.\n"), 0);
+            close(new_socket);
+            pthread_exit(NULL);
+        }
     }
-
-    send(new_socket, "Authenticated!\n", strlen("Authenticated!\n"), 0);
 
     // Command loop
     while (1) {
+        send(new_socket, "Commands: store, retrieve, exit\nEnter command: ", strlen("Commands: store, retrieve, exit\nEnter command: "), 0);
         memset(buffer, 0, BUFFER_SIZE);
-        send(new_socket, "Enter command (store/retrieve/delete/list/exit): ", strlen("Enter command (store/retrieve/delete/list/exit): "), 0);
-        read(new_socket, buffer, BUFFER_SIZE);
-        buffer[strcspn(buffer, "\n")] = 0; // Trim newline
+        read(new_socket, buffer, BUFFER_SIZE - 1);
+        buffer[strcspn(buffer, "\n")] = '\0';
 
         if (strcmp(buffer, "store") == 0) {
-            PasswordEntry entry;
-            memset(&entry, 0, sizeof(entry));
-
             send(new_socket, "Website: ", strlen("Website: "), 0);
             memset(buffer, 0, BUFFER_SIZE);
-            read(new_socket, buffer, BUFFER_SIZE);
-            buffer[strcspn(buffer, "\n")] = 0; // Trim newline
-            strncpy(entry.website, buffer, sizeof(entry.website));
+            int bytes_read = read(new_socket, buffer, sizeof(buffer) - 1);
+            char website[50];
+            strncpy(website, buffer, sizeof(website) - 1);
 
             send(new_socket, "Password: ", strlen("Password: "), 0);
             memset(buffer, 0, BUFFER_SIZE);
-            read(new_socket, buffer, BUFFER_SIZE);
-            buffer[strcspn(buffer, "\n")] = 0; // Trim newline
-            strncpy(entry.password, buffer, sizeof(entry.password));
+            bytes_read = read(new_socket, buffer, sizeof(buffer) - 1);
+            char password[50];
+            strncpy(password, buffer, sizeof(password) - 1);
 
             pthread_mutex_lock(&lock);
-            passwordStore[passwordCount++] = entry;
+            save_password(website, password);
             pthread_mutex_unlock(&lock);
 
             send(new_socket, "Password stored successfully!\n", strlen("Password stored successfully!\n"), 0);
 
         } else if (strcmp(buffer, "retrieve") == 0) {
-            char website[50];
-            memset(website, 0, sizeof(website));
-
             send(new_socket, "Website: ", strlen("Website: "), 0);
             memset(buffer, 0, BUFFER_SIZE);
-            read(new_socket, buffer, BUFFER_SIZE);
-            buffer[strcspn(buffer, "\n")] = 0; // Trim newline
-            strncpy(website, buffer, sizeof(website));
+            read(new_socket, buffer, BUFFER_SIZE - 1);
 
+            char response[BUFFER_SIZE];
             pthread_mutex_lock(&lock);
-            int found = 0;
-            for (int i = 0; i < passwordCount; i++) {
-                if (strcmp(passwordStore[i].website, website) == 0) {
-                    char response[BUFFER_SIZE];
-                    snprintf(response, sizeof(response), "Password: %s\n", passwordStore[i].password);
-                    send(new_socket, response, strlen(response), 0);
-                    found = 1;
-                    break;
-                }
-            }
+            retrieve_password(buffer, response);
             pthread_mutex_unlock(&lock);
 
-            if (!found) {
-                send(new_socket, "Website not found.\n", strlen("Website not found.\n"), 0);
-            }
-
-        } else if (strcmp(buffer, "delete") == 0) {
-            char website[50];
-            memset(website, 0, sizeof(website));
-
-            send(new_socket, "Website to delete: ", strlen("Website to delete: "), 0);
-            memset(buffer, 0, BUFFER_SIZE);
-            read(new_socket, buffer, BUFFER_SIZE);
-            buffer[strcspn(buffer, "\n")] = 0; // Trim newline
-            strncpy(website, buffer, sizeof(website));
-
-            pthread_mutex_lock(&lock);
-            int found = 0;
-            for (int i = 0; i < passwordCount; i++) {
-                if (strcmp(passwordStore[i].website, website) == 0) {
-                    for (int j = i; j < passwordCount - 1; j++) {
-                        passwordStore[j] = passwordStore[j + 1];
-                    }
-                    passwordCount--;
-                    found = 1;
-                    send(new_socket, "Password deleted successfully!\n", strlen("Password deleted successfully!\n"), 0);
-                    break;
-                }
-            }
-            pthread_mutex_unlock(&lock);
-
-            if (!found) {
-                send(new_socket, "Website not found.\n", strlen("Website not found.\n"), 0);
-            }
-
-        } else if (strcmp(buffer, "list") == 0) {
-            pthread_mutex_lock(&lock);
-            if (passwordCount == 0) {
-                send(new_socket, "No passwords stored.\n", strlen("No passwords stored.\n"), 0);
-            } else {
-                for (int i = 0; i < passwordCount; i++) {
-                    char response[BUFFER_SIZE];
-                    snprintf(response, sizeof(response), "%d. %s\n", i + 1, passwordStore[i].website);
-                    send(new_socket, response, strlen(response), 0);
-                }
-            }
-            pthread_mutex_unlock(&lock);
+            send(new_socket, response, strlen(response), 0);
 
         } else if (strcmp(buffer, "exit") == 0) {
             send(new_socket, "Goodbye!\n", strlen("Goodbye!\n"), 0);
@@ -207,7 +229,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, MAX_CLIENTS) < 0) {
+    if (listen(server_fd, 3) < 0) {
         perror("Listen failed");
         exit(EXIT_FAILURE);
     }
